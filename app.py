@@ -13,16 +13,17 @@ import os
 import random
 import re
 import smtplib
-import sqlite3
 import ssl
 import time
-from contextlib import closing
+from contextlib import contextmanager
 from datetime import datetime
 from email.message import EmailMessage
 from hmac import compare_digest
 
 import pandas as pd
 import streamlit as st
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.exc import IntegrityError
 
 DB_PATH = os.environ.get("SANTA_DB", "secret_santa.db")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -35,38 +36,78 @@ st.set_page_config(page_title="Lab Secret Santa", page_icon="🎅", layout="cent
 # --------------------------------------------------------------------------
 # Database
 # --------------------------------------------------------------------------
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+def _database_url() -> str | None:
+    """External database (e.g. Neon/Supabase Postgres) from Secrets or env; None = local SQLite file."""
+    url = None
+    try:
+        url = st.secrets.get("database_url")
+    except Exception:
+        pass
+    url = (url or os.environ.get("DATABASE_URL") or "").strip()
+    return url or None
+
+
+def using_external_db() -> bool:
+    return _database_url() is not None
+
+
+@st.cache_resource
+def get_engine():
+    url = _database_url()
+    if url:
+        for prefix in ("postgres://", "postgresql://"):
+            if url.startswith(prefix):
+                url = "postgresql+psycopg2://" + url[len(prefix):]
+                break
+        return create_engine(url, pool_pre_ping=True, pool_recycle=300,
+                             connect_args={"connect_timeout": 20} if url.startswith("postgresql") else {})
+    engine = create_engine(f"sqlite:///{DB_PATH}")
+
+    @event.listens_for(engine, "connect")
+    def _fk_on(dbapi_conn, _):
+        dbapi_conn.execute("PRAGMA foreign_keys = ON")
+
+    return engine
+
+
+def rows(sql: str, **params) -> list[dict]:
+    """Run a SELECT and return a list of dicts."""
+    with get_engine().connect() as conn:
+        return [dict(r) for r in conn.execute(text(sql), params).mappings()]
+
+
+def run(sql: str, params: dict | list[dict] | None = None) -> None:
+    """Run one write statement (or the same one for a list of param dicts) in a transaction."""
+    with get_engine().begin() as conn:
+        conn.execute(text(sql), params or {})
 
 
 @st.cache_resource
 def init_db() -> bool:
-    with closing(db()) as conn, conn:
-        conn.executescript(
-            """
+    engine = get_engine()
+    pk = "SERIAL PRIMARY KEY" if engine.dialect.name == "postgresql" else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    with engine.begin() as conn:
+        conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS participants (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                id         {pk},
                 name       TEXT NOT NULL,
-                email      TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                email      TEXT NOT NULL UNIQUE,
                 age        INTEGER,
                 sex        TEXT,
                 created_at TEXT NOT NULL
-            );
+            )"""))
+        conn.execute(text("""
             CREATE TABLE IF NOT EXISTS assignments (
                 giver_id    INTEGER PRIMARY KEY REFERENCES participants(id) ON DELETE CASCADE,
                 receiver_id INTEGER NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
                 sent_at     TEXT,
                 error       TEXT
-            );
+            )"""))
+        conn.execute(text("""
             CREATE TABLE IF NOT EXISTS settings (
                 key   TEXT PRIMARY KEY,
                 value TEXT
-            );
-            """
-        )
+            )"""))
     return True
 
 
@@ -81,26 +122,48 @@ DEFAULT_SETTINGS = {
 
 
 def get_settings() -> dict[str, str]:
-    with closing(db()) as conn:
-        rows = conn.execute("SELECT key, value FROM settings").fetchall()
     out = dict(DEFAULT_SETTINGS)
-    out.update({r["key"]: r["value"] for r in rows})
+    out.update({r["key"]: r["value"] for r in rows("SELECT key, value FROM settings")})
     return out
 
 
 def set_settings(**kwargs: str) -> None:
-    with closing(db()) as conn, conn:
+    with get_engine().begin() as conn:
         for k, v in kwargs.items():
             conn.execute(
-                "INSERT INTO settings(key, value) VALUES(?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (k, str(v)),
+                text("INSERT INTO settings(key, value) VALUES(:k, :v) "
+                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value"),
+                {"k": k, "v": str(v)},
             )
 
 
-def list_participants() -> list[sqlite3.Row]:
-    with closing(db()) as conn:
-        return conn.execute("SELECT * FROM participants ORDER BY name COLLATE NOCASE").fetchall()
+def list_participants() -> list[dict]:
+    return rows("SELECT * FROM participants ORDER BY lower(name), id")
+
+
+def import_participants_csv(file) -> tuple[int, int]:
+    """Add participants from a CSV (name, email, age, sex). Returns (added, skipped)."""
+    df_in = pd.read_csv(file)
+    df_in.columns = [str(c).strip().lower() for c in df_in.columns]
+    added = skipped = 0
+    for rec in df_in.to_dict("records"):
+        em = "" if pd.isna(rec.get("email")) else str(rec["email"]).strip().lower()
+        nm = "" if pd.isna(rec.get("name")) else str(rec["name"]).strip()
+        if not nm or not EMAIL_RE.match(em):
+            skipped += 1
+            continue
+        age_v, sex_v = rec.get("age"), rec.get("sex")
+        try:
+            run("INSERT INTO participants(name, email, age, sex, created_at) "
+                "VALUES(:name, :email, :age, :sex, :ts)",
+                {"name": nm, "email": em,
+                 "age": int(age_v) if pd.notna(age_v) else None,
+                 "sex": str(sex_v) if pd.notna(sex_v) else None,
+                 "ts": datetime.now().isoformat(timespec="seconds")})
+            added += 1
+        except IntegrityError:
+            skipped += 1
+    return added, skipped
 
 
 # --------------------------------------------------------------------------
@@ -121,10 +184,11 @@ def make_derangement(ids: list[int], rng: random.Random | None = None) -> dict[i
 def run_draw() -> int:
     people = list_participants()
     mapping = make_derangement([p["id"] for p in people])
-    with closing(db()) as conn, conn:
-        conn.execute("DELETE FROM assignments")
-        conn.executemany(
-            "INSERT INTO assignments(giver_id, receiver_id) VALUES(?, ?)", mapping.items()
+    with get_engine().begin() as conn:
+        conn.execute(text("DELETE FROM assignments"))
+        conn.execute(
+            text("INSERT INTO assignments(giver_id, receiver_id) VALUES(:g, :r)"),
+            [{"g": g, "r": r} for g, r in mapping.items()],
         )
     set_settings(drawn="1", registration_open="0")
     return len(mapping)
@@ -180,7 +244,7 @@ def match_email_body(giver_name: str, receiver: dict, s: dict[str, str], include
         if bits:
             lines += [f"A little hint for gift ideas – {', '.join(bits)}.", ""]
     if s.get("max_gift_eur"):
-        lines.append(f"Maximum gift value: 5€")
+        lines.append(f"Maximum gift value: {s['max_gift_eur']} €")
     if s.get("event_date"):
         lines.append(f"Gift exchange: {s['event_date']}")
     if s.get("extra_message"):
@@ -195,7 +259,7 @@ def send_pending_matches(include_details: bool, only_giver: int | None = None) -
     if cfg is None:
         raise RuntimeError("SMTP is not configured (see README / secrets.toml).")
     s = get_settings()
-    q = """
+    base_sql = """
         SELECT a.giver_id, g.name AS giver_name, g.email AS giver_email,
                r.name AS r_name, r.age AS r_age, r.sex AS r_sex
         FROM assignments a
@@ -203,17 +267,16 @@ def send_pending_matches(include_details: bool, only_giver: int | None = None) -
         JOIN participants r ON r.id = a.receiver_id
         WHERE {where}
     """
-    with closing(db()) as conn:
-        if only_giver is None:
-            rows = conn.execute(q.format(where="a.sent_at IS NULL")).fetchall()
-        else:
-            rows = conn.execute(q.format(where="a.giver_id = ?"), (only_giver,)).fetchall()
+    if only_giver is None:
+        todo = rows(base_sql.format(where="a.sent_at IS NULL"))
+    else:
+        todo = rows(base_sql.format(where="a.giver_id = :gid"), gid=only_giver)
     sent = failed = 0
-    if not rows:
+    if not todo:
         return 0, 0
     server = open_smtp(cfg)
     try:
-        for row in rows:
+        for row in todo:
             receiver = {"name": row["r_name"], "age": row["r_age"], "sex": row["r_sex"]}
             body = match_email_body(row["giver_name"], receiver, s, include_details)
             msg = new_message(cfg, row["giver_email"], f"🎅 {s['event_name']} – your match", body)
@@ -224,11 +287,8 @@ def send_pending_matches(include_details: bool, only_giver: int | None = None) -
             except Exception as exc:  # keep going; record the failure
                 err, ts = str(exc)[:300], None
                 failed += 1
-            with closing(db()) as conn, conn:
-                conn.execute(
-                    "UPDATE assignments SET sent_at = ?, error = ? WHERE giver_id = ?",
-                    (ts, err, row["giver_id"]),
-                )
+            run("UPDATE assignments SET sent_at = :ts, error = :err WHERE giver_id = :gid",
+                {"ts": ts, "err": err, "gid": row["giver_id"]})
     finally:
         try:
             server.quit()
@@ -305,7 +365,7 @@ def page_register() -> None:
     if s["event_date"]:
         meta.append(f"📅 {s['event_date']}")
     if s["max_gift_eur"]:
-        meta.append(f"💶 Maximum gift value: 5€")
+        meta.append(f"💶 Maximum gift value: **{s['max_gift_eur']} €**")
     if meta:
         st.markdown("  \n".join(meta))
 
@@ -344,13 +404,12 @@ def page_register() -> None:
             st.error("Please tick the consent box.")
         else:
             try:
-                with closing(db()) as conn, conn:
-                    conn.execute(
-                        "INSERT INTO participants(name, email, age, sex, created_at) VALUES(?,?,?,?,?)",
-                        (name, email, int(age), sex, datetime.now().isoformat(timespec="seconds")),
-                    )
+                run("INSERT INTO participants(name, email, age, sex, created_at) "
+                    "VALUES(:name, :email, :age, :sex, :ts)",
+                    {"name": name, "email": email, "age": int(age), "sex": sex,
+                     "ts": datetime.now().isoformat(timespec="seconds")})
                 st.success(f"You're in, {name}! 🎄 You'll get an email once the draw is done.")
-            except sqlite3.IntegrityError:
+            except IntegrityError:
                 st.error("This email address is already registered.")
 
     st.caption(f"{len(list_participants())} people registered so far.")
@@ -433,15 +492,23 @@ def tab_participants(s: dict[str, str]) -> None:
         df = pd.DataFrame([dict(p) for p in people]).drop(columns=["id"])
         st.dataframe(df, width="stretch", hide_index=True)
         st.download_button("Download CSV", df.to_csv(index=False), "participants.csv", "text/csv")
+    with st.expander("Restore / import from CSV"):
+        st.caption("Columns: name, email, age, sex (same as the CSV download). Existing emails are skipped.")
+        up = st.file_uploader("CSV file", type="csv")
+        if up is not None and st.button("Import"):
+            try:
+                added, skipped = import_participants_csv(up)
+                st.success(f"Imported {added}, skipped {skipped}.")
+            except Exception as exc:
+                st.error(f"Could not read the file: {exc}")
     if s["drawn"] == "1":
         st.caption("The draw is done – participants can no longer be removed (reset the draw first).")
     elif people:
         st.subheader("Remove a participant")
-        choice = st.selectbox("Participant", people, format_func=lambda p: f"{p['name']} <{p['email']}>",
-                              index=None, placeholder="Select…")
-        if choice and st.button("Remove"):
-            with closing(db()) as conn, conn:
-                conn.execute("DELETE FROM participants WHERE id = ?", (choice["id"],))
+        by_label = {f"{p['name']} <{p['email']}>": p["id"] for p in people}
+        choice = st.selectbox("Participant", list(by_label), index=None, placeholder="Select…")
+        if choice is not None and st.button("Remove"):
+            run("DELETE FROM participants WHERE id = :id", {"id": by_label[choice]})
             st.rerun()
 
 
@@ -477,19 +544,18 @@ def tab_draw(s: dict[str, str]) -> None:
         return
 
     st.success("The draw is done. Nobody (including you) can see the matches here.")
-    with closing(db()) as conn:
-        rows = conn.execute(
-            "SELECT g.id, g.name, g.email, a.sent_at, a.error FROM assignments a "
-            "JOIN participants g ON g.id = a.giver_id ORDER BY g.name COLLATE NOCASE"
-        ).fetchall()
+    status_rows = rows(
+        "SELECT g.id, g.name, g.email, a.sent_at, a.error FROM assignments a "
+        "JOIN participants g ON g.id = a.giver_id ORDER BY lower(g.name), g.id"
+    )
     status = pd.DataFrame(
         [{"name": r["name"], "email": r["email"],
           "status": "✅ sent " + r["sent_at"] if r["sent_at"] else ("❌ " + r["error"] if r["error"] else "⏳ not sent")}
-         for r in rows]
+         for r in status_rows]
     )
     st.dataframe(status, width="stretch", hide_index=True)
 
-    pending = sum(1 for r in rows if not r["sent_at"])
+    pending = sum(1 for r in status_rows if not r["sent_at"])
     if cfg and pending and st.button(f"✉️ Send {pending} pending email(s)", type="primary"):
         with st.spinner("Sending…"):
             try:
@@ -499,13 +565,13 @@ def tab_draw(s: dict[str, str]) -> None:
                 st.error(f"SMTP error: {exc}")
         st.rerun()
 
-    if cfg and rows:
+    if cfg and status_rows:
         with st.expander("Resend to one person"):
-            who = st.selectbox("Person", rows, format_func=lambda r: f"{r['name']} <{r['email']}>",
-                               index=None, placeholder="Select…")
-            if who and st.button("Resend"):
+            who_by_label = {f"{r['name']} <{r['email']}>": r["id"] for r in status_rows}
+            who = st.selectbox("Person", list(who_by_label), index=None, placeholder="Select…")
+            if who is not None and st.button("Resend"):
                 try:
-                    sent, failed = send_pending_matches(include_details, only_giver=who["id"])
+                    sent, failed = send_pending_matches(include_details, only_giver=who_by_label[who])
                     st.success("Resent.") if sent else st.error("Failed – see status table.")
                 except Exception as exc:
                     st.error(f"SMTP error: {exc}")
@@ -514,8 +580,7 @@ def tab_draw(s: dict[str, str]) -> None:
     with st.expander("⚠️ Reset the draw"):
         st.caption("Deletes all matches so you can draw again. Anyone already emailed will have an outdated match!")
         if st.checkbox("I understand") and st.button("Reset draw"):
-            with closing(db()) as conn, conn:
-                conn.execute("DELETE FROM assignments")
+            run("DELETE FROM assignments")
             set_settings(drawn="0")
             st.rerun()
 
@@ -523,10 +588,10 @@ def tab_draw(s: dict[str, str]) -> None:
 def tab_cleanup() -> None:
     st.write("After the event, delete all personal data (names, emails, age, sex, matches).")
     if st.checkbox("Yes, delete everything") and st.button("Delete all data", type="primary"):
-        with closing(db()) as conn, conn:
-            conn.execute("DELETE FROM assignments")
-            conn.execute("DELETE FROM participants")
-            conn.execute("DELETE FROM settings WHERE key IN ('drawn','registration_open')")
+        with get_engine().begin() as conn:
+            conn.execute(text("DELETE FROM assignments"))
+            conn.execute(text("DELETE FROM participants"))
+            conn.execute(text("DELETE FROM settings WHERE key IN ('drawn','registration_open')"))
         st.success("All participant data deleted.")
         st.rerun()
 
@@ -534,6 +599,12 @@ def tab_cleanup() -> None:
 def page_admin() -> None:
     s = get_settings()
     st.title("🎅 Organizer panel")
+    if using_external_db():
+        st.success("💾 Data is stored in an external database – it survives app restarts.")
+    else:
+        st.warning("⚠️ Data is stored in a local file. That is fine on your own computer or server, but on "
+                   "Streamlit Cloud it is **wiped whenever the app restarts or is redeployed**. "
+                   "Add `database_url` to Secrets (see README).")
     t1, t2, t3, t4 = st.tabs(["Setup & invites", "Participants", "Draw & emails", "Cleanup"])
     with t1:
         tab_setup(s)
