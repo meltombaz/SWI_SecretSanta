@@ -263,6 +263,7 @@ def send_plain_emails(items: list[tuple[str, str, str]]) -> tuple[int, list[str]
 # Look & feel
 # --------------------------------------------------------------------------
 def set_background() -> None:
+    """Photo background + a card that follows the viewer's light/dark mode."""
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "background.jpg")
     if not os.path.exists(path):
         return
@@ -281,6 +282,12 @@ def set_background() -> None:
             padding: 2rem 2.5rem 2.5rem 2.5rem !important;
             margin-top: 1.5rem;
             box-shadow: 0 6px 30px rgba(40, 40, 90, 0.25);
+        }}
+        /* Streamlit follows the OS/browser setting, so the card does too. */
+        @media (prefers-color-scheme: dark) {{
+            [data-testid="stMainBlockContainer"], .block-container {{
+                background: rgba(20, 22, 34, 0.88);
+            }}
         }}
         </style>
         """,
