@@ -244,7 +244,7 @@ def match_email_body(giver_name: str, receiver: dict, s: dict[str, str], include
         if bits:
             lines += [f"A little hint for gift ideas – {', '.join(bits)}.", ""]
     if s.get("max_gift_eur"):
-        lines.append(f"Maximum gift value: {s['max_gift_eur']} €")
+        lines.append(f"Maximum gift value: 5€")
     if s.get("event_date"):
         lines.append(f"Gift exchange: {s['event_date']}")
     if s.get("extra_message"):
@@ -365,7 +365,7 @@ def page_register() -> None:
     if s["event_date"]:
         meta.append(f"📅 {s['event_date']}")
     if s["max_gift_eur"]:
-        meta.append(f"💶 Maximum gift value: **{s['max_gift_eur']} €**")
+        meta.append(f"💶 Maximum gift value: 5€**")
     if meta:
         st.markdown("  \n".join(meta))
 
