@@ -1,6 +1,6 @@
 """Lab Secret Santa – a small Streamlit app.
 
-Participants register via the app link (name, email, age, sex).
+Participants register via the app link (name, email).
 The organizer logs in (sidebar), runs the draw and sends the match emails.
 Nobody – including the organizer – sees who drew whom unless they open
 their own email.
@@ -29,7 +29,6 @@ from sqlalchemy.exc import IntegrityError
 
 DB_PATH = os.environ.get("SANTA_DB", "secret_santa.db")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-SEX_OPTIONS = ["female", "male", "diverse", "prefer not to say"]
 
 st.set_page_config(page_title="Lab Secret Santa", page_icon="🎅", layout="centered",
                    initial_sidebar_state="collapsed")
@@ -104,8 +103,6 @@ def init_db() -> bool:
                 id         {pk},
                 name       TEXT NOT NULL,
                 email      TEXT NOT NULL UNIQUE,
-                age        INTEGER,
-                sex        TEXT,
                 created_at TEXT NOT NULL
             )"""))
         conn.execute(text("""
@@ -126,7 +123,7 @@ def init_db() -> bool:
 DEFAULT_SETTINGS = {
     "event_name": "Lab Secret Santa",
     "event_date": "",
-    "max_gift_eur": "10",
+    "max_gift_eur": "5",
     "extra_message": "",
     "registration_open": "1",
     "drawn": "0",
@@ -154,7 +151,7 @@ def list_participants() -> list[dict]:
 
 
 def import_participants_csv(file) -> tuple[int, int]:
-    """Add participants from a CSV (name, email, age, sex). Returns (added, skipped)."""
+    """Add participants from a CSV with columns name, email (other columns ignored). Returns (added, skipped)."""
     df_in = pd.read_csv(file)
     df_in.columns = [str(c).strip().lower() for c in df_in.columns]
     added = skipped = 0
@@ -164,14 +161,9 @@ def import_participants_csv(file) -> tuple[int, int]:
         if not nm or not EMAIL_RE.match(em):
             skipped += 1
             continue
-        age_v, sex_v = rec.get("age"), rec.get("sex")
         try:
-            run("INSERT INTO participants(name, email, age, sex, created_at) "
-                "VALUES(:name, :email, :age, :sex, :ts)",
-                {"name": nm, "email": em,
-                 "age": int(age_v) if pd.notna(age_v) else None,
-                 "sex": str(sex_v) if pd.notna(sex_v) else None,
-                 "ts": datetime.now().isoformat(timespec="seconds")})
+            run("INSERT INTO participants(name, email, created_at) VALUES(:name, :email, :ts)",
+                {"name": nm, "email": em, "ts": datetime.now().isoformat(timespec="seconds")})
             added += 1
         except IntegrityError:
             skipped += 1
@@ -245,18 +237,10 @@ def new_message(cfg: dict, to_addr: str, subject: str, body: str) -> EmailMessag
     return msg
 
 
-def match_email_body(giver_name: str, receiver: dict, s: dict[str, str], include_details: bool) -> str:
+def match_email_body(giver_name: str, receiver: dict, s: dict[str, str]) -> str:
     lines = [f"Hi {giver_name},", "", f"You are the Secret Santa for: {receiver['name']}", ""]
-    if include_details:
-        bits = []
-        if receiver.get("age"):
-            bits.append(f"age: {receiver['age']}")
-        if receiver.get("sex") and receiver["sex"] != "prefer not to say":
-            bits.append(f"sex: {receiver['sex']}")
-        if bits:
-            lines += [f"A little hint for gift ideas – {', '.join(bits)}.", ""]
     if s.get("max_gift_eur"):
-        lines.append(f"Maximum gift value: 5€")
+        lines.append(f"Maximum gift value: {s['max_gift_eur']} €")
     if s.get("event_date"):
         lines.append(f"Gift exchange: {s['event_date']}")
     if s.get("extra_message"):
@@ -265,7 +249,7 @@ def match_email_body(giver_name: str, receiver: dict, s: dict[str, str], include
     return "\n".join(lines)
 
 
-def send_pending_matches(include_details: bool, only_giver: int | None = None) -> tuple[int, int]:
+def send_pending_matches(only_giver: int | None = None) -> tuple[int, int]:
     """Send match emails that have not been sent yet. Returns (sent, failed)."""
     cfg = smtp_config()
     if cfg is None:
@@ -273,7 +257,7 @@ def send_pending_matches(include_details: bool, only_giver: int | None = None) -
     s = get_settings()
     base_sql = """
         SELECT a.giver_id, g.name AS giver_name, g.email AS giver_email,
-               r.name AS r_name, r.age AS r_age, r.sex AS r_sex
+               r.name AS r_name
         FROM assignments a
         JOIN participants g ON g.id = a.giver_id
         JOIN participants r ON r.id = a.receiver_id
@@ -289,8 +273,7 @@ def send_pending_matches(include_details: bool, only_giver: int | None = None) -
     server = open_smtp(cfg)
     try:
         for row in todo:
-            receiver = {"name": row["r_name"], "age": row["r_age"], "sex": row["r_sex"]}
-            body = match_email_body(row["giver_name"], receiver, s, include_details)
+            body = match_email_body(row["giver_name"], {"name": row["r_name"]}, s)
             msg = new_message(cfg, row["giver_email"], f"🎅 {s['event_name']} – your match", body)
             try:
                 server.send_message(msg)
@@ -331,13 +314,13 @@ def send_plain_emails(items: list[tuple[str, str, str]]) -> tuple[int, list[str]
     return sent, errors
 
 
-def csv_line(name: str, email: str, age: int, sex: str) -> str:
+def csv_line(name: str, email: str) -> str:
     buf = io.StringIO()
-    csv.writer(buf, lineterminator="").writerow([name, email, age, sex])
+    csv.writer(buf, lineterminator="").writerow([name, email])
     return buf.getvalue()
 
 
-def notify_organizer(name: str, email: str, age: int, sex: str) -> None:
+def notify_organizer(name: str, email: str) -> None:
     """Email the organizer a copy of each sign-up (backup). Never blocks the sign-up if it fails."""
     try:
         to = (st.secrets.get("notify_email") or "").strip()
@@ -347,8 +330,8 @@ def notify_organizer(name: str, email: str, age: int, sex: str) -> None:
         return
     try:
         total = len(list_participants())
-        body = (f"New sign-up #{total}\n\nName: {name}\nEmail: {email}\nAge: {age}\nSex: {sex}\n\n"
-                f"Backup line (paste into Organizer panel > Participants > Restore):\n{csv_line(name, email, age, sex)}\n")
+        body = (f"New sign-up #{total}\n\nName: {name}\nEmail: {email}\n\n"
+                f"Backup line (paste into Organizer panel > Participants > Restore):\n{csv_line(name, email)}\n")
         send_plain_emails([(to, f"Secret Santa sign-up #{total}: {name}", body)])
     except Exception:
         pass
@@ -400,7 +383,7 @@ def page_register() -> None:
     if s["event_date"]:
         meta.append(f"📅 {s['event_date']}")
     if s["max_gift_eur"]:
-        meta.append(f"💶 Maximum gift value: 5€")
+        meta.append(f"💶 Maximum gift value: **{s['max_gift_eur']} €**")
     if meta:
         st.markdown("  \n".join(meta))
 
@@ -421,13 +404,9 @@ def page_register() -> None:
     with st.form("register", clear_on_submit=True):
         name = st.text_input("Name", max_chars=80)
         email = st.text_input("Email", max_chars=120)
-        c1, c2 = st.columns(2)
-        age = c1.number_input("Age", min_value=16, max_value=99, value=None, step=1)
-        sex = c2.selectbox("Sex", SEX_OPTIONS, index=None, placeholder="Select…")
         consent = st.checkbox(
-            "I agree that my name, email, age and sex are stored for this Secret Santa only. "
-            "Age and sex may be shared with my Secret Santa as a gift hint; email is never shared. "
-            "Data is deleted after the event."
+            "I agree that my name and email are stored for this Secret Santa only. "
+            "My email is never shared with other participants and all data is deleted after the event."
         )
         submitted = st.form_submit_button("Join Secret Santa 🎁", type="primary")
 
@@ -437,17 +416,13 @@ def page_register() -> None:
             st.error("Please enter your name.")
         elif not EMAIL_RE.match(email):
             st.error("Please enter a valid email address.")
-        elif age is None or sex is None:
-            st.error("Please fill in age and sex.")
         elif not consent:
             st.error("Please tick the consent box.")
         else:
             try:
-                run("INSERT INTO participants(name, email, age, sex, created_at) "
-                    "VALUES(:name, :email, :age, :sex, :ts)",
-                    {"name": name, "email": email, "age": int(age), "sex": sex,
-                     "ts": datetime.now().isoformat(timespec="seconds")})
-                notify_organizer(name, email, int(age), sex)
+                run("INSERT INTO participants(name, email, created_at) VALUES(:name, :email, :ts)",
+                    {"name": name, "email": email, "ts": datetime.now().isoformat(timespec="seconds")})
+                notify_organizer(name, email)
                 st.success(f"You're in, {name}! 🎄 You'll get an email once the draw is done.")
             except IntegrityError:
                 st.error("This email address is already registered.")
@@ -489,7 +464,7 @@ def tab_setup(s: dict[str, str]) -> None:
         event_date = st.text_input("Date / place of gift exchange", s["event_date"],
                                    placeholder="e.g. 17 Dec 2026, 15:00, seminar room")
         max_gift = st.number_input("Maximum gift value (€)", min_value=0, max_value=500, step=1,
-                                   value=int(s["max_gift_eur"] or 10))
+                                   value=int(s["max_gift_eur"] or 5))
         extra = st.text_area("Extra text for the match email", s["extra_message"])
         reg_open = st.checkbox("Registration open", s["registration_open"] == "1")
         if st.form_submit_button("Save", type="primary"):
@@ -513,7 +488,7 @@ def tab_setup(s: dict[str, str]) -> None:
             body = (f"Hi!\n\nYou're invited to join our {s['event_name']}.\n"
                     f"Please sign up here: {app_url.strip()}\n")
             if s["max_gift_eur"]:
-                body += f"\nMaximum gift value: 5€"
+                body += f"\nMaximum gift value: {s['max_gift_eur']} €"
             if s["event_date"]:
                 body += f"\nWhen: {s['event_date']}"
             try:
@@ -529,11 +504,11 @@ def tab_participants(s: dict[str, str]) -> None:
     people = list_participants()
     st.metric("Registered", len(people))
     if people:
-        df = pd.DataFrame([dict(p) for p in people]).drop(columns=["id"])
+        df = pd.DataFrame(people)[["name", "email", "created_at"]]
         st.dataframe(df, width="stretch", hide_index=True)
         st.download_button("Download CSV", df.to_csv(index=False), "participants.csv", "text/csv")
     with st.expander("Restore / import from CSV"):
-        st.caption("Columns: name, email, age, sex (same as the CSV download). Existing emails are skipped.")
+        st.caption("Columns: name, email (same as the CSV download). Existing emails are skipped.")
         up = st.file_uploader("CSV file", type="csv")
         if up is not None and st.button("Import file"):
             try:
@@ -541,11 +516,11 @@ def tab_participants(s: dict[str, str]) -> None:
                 st.success(f"Imported {added}, skipped {skipped}.")
             except Exception as exc:
                 st.error(f"Could not read the file: {exc}")
-        st.caption("Or paste the backup lines from your sign-up emails (one per line: name,email,age,sex):")
+        st.caption("Or paste the backup lines from your sign-up emails (one per line: name,email):")
         pasted = st.text_area("Pasted lines", height=120, key="paste_import")
         if st.button("Import pasted lines") and pasted.strip():
             try:
-                added, skipped = import_participants_csv(io.StringIO("name,email,age,sex\n" + pasted.strip()))
+                added, skipped = import_participants_csv(io.StringIO("name,email\n" + pasted.strip()))
                 st.success(f"Imported {added}, skipped {skipped}.")
             except Exception as exc:
                 st.error(f"Could not read the lines: {exc}")
@@ -566,16 +541,14 @@ def tab_draw(s: dict[str, str]) -> None:
     if cfg is None:
         st.warning("SMTP is not configured – you can run the draw, but not send emails. See README.")
 
-    include_details = st.checkbox("Include the match's age and sex in the email as a gift hint", value=True)
-
     with st.expander("Preview of the email (example data)"):
-        st.code(match_email_body("Alex", {"name": "Sam", "age": 29, "sex": "female"}, s, include_details))
+        st.code(match_email_body("Alex", {"name": "Sam"}, s))
 
     if cfg:
         test_to = st.text_input("Send a test email to (your own address)")
         if st.button("Send test email") and EMAIL_RE.match(test_to.strip()):
             try:
-                body = match_email_body("Alex", {"name": "Sam (TEST)", "age": 29, "sex": "female"}, s, include_details)
+                body = match_email_body("Alex", {"name": "Sam (TEST)"}, s)
                 sent, errs = send_plain_emails([(test_to.strip(), "TEST – Secret Santa", body)])
                 st.success("Test email sent.") if sent else st.error(errs[0])
             except Exception as exc:
@@ -607,7 +580,7 @@ def tab_draw(s: dict[str, str]) -> None:
     if cfg and pending and st.button(f"✉️ Send {pending} pending email(s)", type="primary"):
         with st.spinner("Sending…"):
             try:
-                sent, failed = send_pending_matches(include_details)
+                sent, failed = send_pending_matches()
                 (st.success if not failed else st.warning)(f"Sent: {sent}, failed: {failed}")
             except Exception as exc:
                 st.error(f"SMTP error: {exc}")
@@ -619,7 +592,7 @@ def tab_draw(s: dict[str, str]) -> None:
             who = st.selectbox("Person", list(who_by_label), index=None, placeholder="Select…")
             if who is not None and st.button("Resend"):
                 try:
-                    sent, failed = send_pending_matches(include_details, only_giver=who_by_label[who])
+                    sent, failed = send_pending_matches(only_giver=who_by_label[who])
                     st.success("Resent.") if sent else st.error("Failed – see status table.")
                 except Exception as exc:
                     st.error(f"SMTP error: {exc}")
@@ -634,7 +607,7 @@ def tab_draw(s: dict[str, str]) -> None:
 
 
 def tab_cleanup() -> None:
-    st.write("After the event, delete all personal data (names, emails, age, sex, matches).")
+    st.write("After the event, delete all personal data (names, emails, matches).")
     if st.checkbox("Yes, delete everything") and st.button("Delete all data", type="primary"):
         with get_engine().begin() as conn:
             conn.execute(text("DELETE FROM assignments"))
