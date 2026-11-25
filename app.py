@@ -9,6 +9,8 @@ their own email.
 from __future__ import annotations
 
 import base64
+import csv
+import io
 import os
 import random
 import re
@@ -49,6 +51,16 @@ def _database_url() -> str | None:
 
 def using_external_db() -> bool:
     return _database_url() is not None
+
+
+def local_db_allowed() -> bool:
+    """Local SQLite file is only OK if explicitly allowed (own computer/server), never by accident."""
+    try:
+        if st.secrets.get("allow_local_db"):
+            return True
+    except Exception:
+        pass
+    return os.environ.get("ALLOW_LOCAL_DB", "").lower() in ("1", "true", "yes")
 
 
 @st.cache_resource
@@ -319,6 +331,29 @@ def send_plain_emails(items: list[tuple[str, str, str]]) -> tuple[int, list[str]
     return sent, errors
 
 
+def csv_line(name: str, email: str, age: int, sex: str) -> str:
+    buf = io.StringIO()
+    csv.writer(buf, lineterminator="").writerow([name, email, age, sex])
+    return buf.getvalue()
+
+
+def notify_organizer(name: str, email: str, age: int, sex: str) -> None:
+    """Email the organizer a copy of each sign-up (backup). Never blocks the sign-up if it fails."""
+    try:
+        to = (st.secrets.get("notify_email") or "").strip()
+    except Exception:
+        to = ""
+    if not to or smtp_config() is None:
+        return
+    try:
+        total = len(list_participants())
+        body = (f"New sign-up #{total}\n\nName: {name}\nEmail: {email}\nAge: {age}\nSex: {sex}\n\n"
+                f"Backup line (paste into Organizer panel > Participants > Restore):\n{csv_line(name, email, age, sex)}\n")
+        send_plain_emails([(to, f"Secret Santa sign-up #{total}: {name}", body)])
+    except Exception:
+        pass
+
+
 # --------------------------------------------------------------------------
 # Look & feel
 # --------------------------------------------------------------------------
@@ -365,10 +400,14 @@ def page_register() -> None:
     if s["event_date"]:
         meta.append(f"📅 {s['event_date']}")
     if s["max_gift_eur"]:
-        meta.append(f"💶 Maximum gift value: 5€**")
+        meta.append(f"💶 Maximum gift value: **{s['max_gift_eur']} €**")
     if meta:
         st.markdown("  \n".join(meta))
 
+    if not using_external_db() and not local_db_allowed():
+        st.error("Sign-up is temporarily unavailable: the app's data storage is not set up yet. "
+                 "Please tell the organizer.")
+        return
     if s["drawn"] == "1":
         st.info("The draw has already happened and registration is closed. Check your inbox for your match! 🎁")
         return
@@ -408,6 +447,7 @@ def page_register() -> None:
                     "VALUES(:name, :email, :age, :sex, :ts)",
                     {"name": name, "email": email, "age": int(age), "sex": sex,
                      "ts": datetime.now().isoformat(timespec="seconds")})
+                notify_organizer(name, email, int(age), sex)
                 st.success(f"You're in, {name}! 🎄 You'll get an email once the draw is done.")
             except IntegrityError:
                 st.error("This email address is already registered.")
@@ -473,7 +513,7 @@ def tab_setup(s: dict[str, str]) -> None:
             body = (f"Hi!\n\nYou're invited to join our {s['event_name']}.\n"
                     f"Please sign up here: {app_url.strip()}\n")
             if s["max_gift_eur"]:
-                body += f"\nMaximum gift value: {s['max_gift_eur']} €"
+                body += f"\nMaximum gift value: 5€"
             if s["event_date"]:
                 body += f"\nWhen: {s['event_date']}"
             try:
@@ -495,12 +535,20 @@ def tab_participants(s: dict[str, str]) -> None:
     with st.expander("Restore / import from CSV"):
         st.caption("Columns: name, email, age, sex (same as the CSV download). Existing emails are skipped.")
         up = st.file_uploader("CSV file", type="csv")
-        if up is not None and st.button("Import"):
+        if up is not None and st.button("Import file"):
             try:
                 added, skipped = import_participants_csv(up)
                 st.success(f"Imported {added}, skipped {skipped}.")
             except Exception as exc:
                 st.error(f"Could not read the file: {exc}")
+        st.caption("Or paste the backup lines from your sign-up emails (one per line: name,email,age,sex):")
+        pasted = st.text_area("Pasted lines", height=120, key="paste_import")
+        if st.button("Import pasted lines") and pasted.strip():
+            try:
+                added, skipped = import_participants_csv(io.StringIO("name,email,age,sex\n" + pasted.strip()))
+                st.success(f"Imported {added}, skipped {skipped}.")
+            except Exception as exc:
+                st.error(f"Could not read the lines: {exc}")
     if s["drawn"] == "1":
         st.caption("The draw is done – participants can no longer be removed (reset the draw first).")
     elif people:
@@ -601,10 +649,12 @@ def page_admin() -> None:
     st.title("🎅 Organizer panel")
     if using_external_db():
         st.success("💾 Data is stored in an external database – it survives app restarts.")
+    elif local_db_allowed():
+        st.warning("⚠️ Data is stored in a local file (allowed by `allow_local_db`). Fine on your own computer or "
+                   "server, but on Streamlit Cloud it is **wiped whenever the app restarts or is redeployed**.")
     else:
-        st.warning("⚠️ Data is stored in a local file. That is fine on your own computer or server, but on "
-                   "Streamlit Cloud it is **wiped whenever the app restarts or is redeployed**. "
-                   "Add `database_url` to Secrets (see README).")
+        st.error("🛑 No database configured – sign-up is switched off so no data gets lost. "
+                 "Add `database_url` to Secrets (see README) and reboot the app.")
     t1, t2, t3, t4 = st.tabs(["Setup & invites", "Participants", "Draw & emails", "Cleanup"])
     with t1:
         tab_setup(s)
