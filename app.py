@@ -305,7 +305,7 @@ def page_register() -> None:
     if s["event_date"]:
         meta.append(f"📅 {s['event_date']}")
     if s["max_gift_eur"]:
-        meta.append(f"💶 Maximum gift value: 5-10 €**")
+        meta.append(f"💶 Maximum gift value: 5-10 €")
     if meta:
         st.markdown("  \n".join(meta))
 
