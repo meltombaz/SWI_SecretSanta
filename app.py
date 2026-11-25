@@ -73,7 +73,7 @@ def init_db() -> bool:
 DEFAULT_SETTINGS = {
     "event_name": "Lab Secret Santa",
     "event_date": "",
-    "max_gift_eur": "10",
+    "max_gift_eur": "5-10",
     "extra_message": "",
     "registration_open": "1",
     "drawn": "0",
