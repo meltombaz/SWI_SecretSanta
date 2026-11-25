@@ -73,7 +73,7 @@ def init_db() -> bool:
 DEFAULT_SETTINGS = {
     "event_name": "Lab Secret Santa",
     "event_date": "",
-    "max_gift_eur": "5-10",
+    "max_gift_eur": "10",
     "extra_message": "",
     "registration_open": "1",
     "drawn": "0",
@@ -180,7 +180,7 @@ def match_email_body(giver_name: str, receiver: dict, s: dict[str, str], include
         if bits:
             lines += [f"A little hint for gift ideas – {', '.join(bits)}.", ""]
     if s.get("max_gift_eur"):
-        lines.append(f"Maximum gift value: {s['max_gift_eur']} €")
+        lines.append(f"Maximum gift value: 5-10 €")
     if s.get("event_date"):
         lines.append(f"Gift exchange: {s['event_date']}")
     if s.get("extra_message"):
