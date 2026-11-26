@@ -185,9 +185,124 @@ def make_derangement(ids: list[int], rng: random.Random | None = None) -> dict[i
             return dict(zip(ids, perm))
 
 
-def run_draw() -> int:
+PAIR_RE = re.compile(r"^\s*(.+?)\s*(<->|<>|->|>)\s*(.+?)\s*$")
+
+
+def resolve_person(token: str, people: list[dict]) -> int:
+    """Find a participant by exact email or exact name (case-insensitive)."""
+    t = token.strip().casefold()
+    by_email = [p for p in people if p["email"].casefold() == t]
+    if by_email:
+        return by_email[0]["id"]
+    by_name = [p for p in people if p["name"].strip().casefold() == t]
+    if not by_name:
+        raise ValueError(f'"{token.strip()}" is not a registered participant '
+                         "(use the exact name or the email address).")
+    if len(by_name) > 1:
+        raise ValueError(f'"{token.strip()}" matches several people - use the email address instead.')
+    return by_name[0]["id"]
+
+
+def parse_pair_rules(rules_text: str, people: list[dict]) -> set[tuple[int, int]]:
+    """Parse lines like 'Anna > Ben' (Anna gives to Ben) or 'Anna <> Ben' (both directions).
+    Returns a set of (giver_id, receiver_id). Blank lines and lines starting with # are ignored."""
+    edges: set[tuple[int, int]] = set()
+    for n, line in enumerate(rules_text.splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = PAIR_RE.match(line)
+        if not m:
+            raise ValueError(f'Line {n} ("{line}"): write it as  Name > Name  or  Name <> Name.')
+        a = resolve_person(m.group(1), people)
+        b = resolve_person(m.group(3), people)
+        if a == b:
+            raise ValueError(f'Line {n} ("{line}"): a person cannot be paired with themselves.')
+        edges.add((a, b))
+        if m.group(2) in ("<>", "<->"):
+            edges.add((b, a))
+    return edges
+
+
+def _has_perfect_matching(allowed: dict[int, set[int]]) -> bool:
+    """True if every giver in `allowed` can get a different receiver from its allowed set."""
+    match_r: dict[int, int] = {}
+
+    def augment(g: int, seen: set[int]) -> bool:
+        for r in allowed[g]:
+            if r in seen:
+                continue
+            seen.add(r)
+            if r not in match_r or augment(match_r[r], seen):
+                match_r[r] = g
+                return True
+        return False
+
+    return all(augment(g, set()) for g in allowed)
+
+
+def make_constrained_draw(ids: list[int], forced: set[tuple[int, int]], forbidden: set[tuple[int, int]],
+                          rng: random.Random | None = None, max_tries: int = 20000) -> dict[int, int]:
+    """Random giver -> receiver assignment where nobody draws themselves, every `forced` (giver, receiver)
+    pair is present and no `forbidden` pair is. Raises ValueError if the rules cannot all be met."""
+    if len(ids) < 3:
+        raise ValueError("Need at least 3 participants for a Secret Santa draw.")
+    rng = rng or random.SystemRandom()
+    known = set(ids)
+
+    fixed_giver: dict[int, int] = {}
+    fixed_recv: dict[int, int] = {}
+    for g, r in forced:
+        if g not in known or r not in known or g == r:
+            raise ValueError("A wanted pairing refers to someone who is not in the draw.")
+        if (g, r) in forbidden:
+            raise ValueError("A wanted pairing is also on the avoid list.")
+        if fixed_giver.get(g, r) != r:
+            raise ValueError("Someone is set to give to two different people in the wanted pairings.")
+        if fixed_recv.get(r, g) != g:
+            raise ValueError("Someone is set to receive from two different people in the wanted pairings.")
+        fixed_giver[g], fixed_recv[r] = r, g
+
+    free_g = [g for g in ids if g not in fixed_giver]
+    free_r = [r for r in ids if r not in fixed_recv]
+    allowed = {g: {r for r in free_r if r != g and (g, r) not in forbidden} for g in free_g}
+    if not _has_perfect_matching(allowed):
+        raise ValueError("These rules cannot all be met with the current participants "
+                         "(someone would have nobody left to give to). Remove or loosen a rule.")
+
+    # Fast path: shuffle and accept - uniform over every assignment that satisfies the rules.
+    for _ in range(max_tries):
+        perm = list(free_r)
+        rng.shuffle(perm)
+        if all(r in allowed[g] for g, r in zip(free_g, perm)):
+            return {**fixed_giver, **dict(zip(free_g, perm))}
+
+    # Fallback for very tight rules: pick randomly but only keep choices that can still be completed.
+    remaining = {g: set(rs) for g, rs in allowed.items()}
+    result = dict(fixed_giver)
+    order = list(free_g)
+    rng.shuffle(order)
+    for g in order:
+        options = sorted(remaining[g])
+        rng.shuffle(options)
+        for r in options:
+            trial = {h: rs - {r} for h, rs in remaining.items() if h != g}
+            if _has_perfect_matching(trial):
+                result[g] = r
+                remaining = trial
+                break
+        else:  # cannot happen once feasibility was verified above
+            raise ValueError("Could not complete the draw with these rules.")
+    return result
+
+
+def run_draw(forced: set[tuple[int, int]] | None = None, forbidden: set[tuple[int, int]] | None = None) -> int:
     people = list_participants()
-    mapping = make_derangement([p["id"] for p in people])
+    ids = [p["id"] for p in people]
+    if forced or forbidden:
+        mapping = make_constrained_draw(ids, forced or set(), forbidden or set())
+    else:
+        mapping = make_derangement(ids)
     with get_engine().begin() as conn:
         conn.execute(text("DELETE FROM assignments"))
         conn.execute(
@@ -559,9 +674,23 @@ def tab_draw(s: dict[str, str]) -> None:
         st.write(f"**{len(people)}** participants registered.")
         if len(people) < 3:
             st.info("You need at least 3 participants.")
-        elif st.button("🎲 Run the draw", type="primary"):
-            run_draw()
-            st.rerun()
+            return
+        with st.expander("🔒 Pairing rules (optional - only you see these; not stored, not emailed)"):
+            st.caption("One rule per line, using exact names or emails. `Anna > Ben` = Anna gives to Ben. "
+                       "`Anna <> Ben` = both directions. Everything else stays random.")
+            must_txt = st.text_area("Wanted pairings", key="rules_must", height=100,
+                                    placeholder="Anna > Ben\nCara <> Dev")
+            avoid_txt = st.text_area("Pairings to avoid", key="rules_avoid", height=100,
+                                     placeholder="Eli <> Fay    (neither draws the other)\nGus > Hana    (only Gus must not draw Hana)")
+        if st.button("🎲 Run the draw", type="primary"):
+            try:
+                forced = parse_pair_rules(must_txt, people)
+                forbidden = parse_pair_rules(avoid_txt, people)
+                run_draw(forced, forbidden)
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                st.rerun()
         return
 
     st.success("The draw is done. The matches stay hidden unless you open the organizer check below.")
