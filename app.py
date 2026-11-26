@@ -564,7 +564,7 @@ def tab_draw(s: dict[str, str]) -> None:
             st.rerun()
         return
 
-    st.success("The draw is done. Nobody (including you) can see the matches here.")
+    st.success("The draw is done. The matches stay hidden unless you open the organizer check below.")
     status_rows = rows(
         "SELECT g.id, g.name, g.email, a.sent_at, a.error FROM assignments a "
         "JOIN participants g ON g.id = a.giver_id ORDER BY lower(g.name), g.id"
@@ -575,6 +575,16 @@ def tab_draw(s: dict[str, str]) -> None:
          for r in status_rows]
     )
     st.dataframe(status, width="stretch", hide_index=True)
+
+    with st.expander("👁 Organizer check: show all matches"):
+        st.caption("This reveals who gives to whom. Only open it if you are fine with knowing the matches.")
+        if st.checkbox("Yes, show me all matches"):
+            match_rows = rows(
+                "SELECT g.name AS giver, r.name AS receiver FROM assignments a "
+                "JOIN participants g ON g.id = a.giver_id "
+                "JOIN participants r ON r.id = a.receiver_id ORDER BY lower(g.name), g.id"
+            )
+            st.dataframe(pd.DataFrame(match_rows), width="stretch", hide_index=True)
 
     pending = sum(1 for r in status_rows if not r["sent_at"])
     if cfg and pending and st.button(f"✉️ Send {pending} pending email(s)", type="primary"):
